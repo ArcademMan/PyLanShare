@@ -39,10 +39,6 @@ Part of the **AmMstools** suite.
 - **Dark theme** — modern UI with Segoe UI, rounded corners, blue accents
 - **Internationalization** — English and Italian, with auto-detection
 
-## Screenshots
-
-> _Coming soon._
-
 ## Requirements
 
 | Dependency | Version |
@@ -82,15 +78,6 @@ python -m pylanshare
 1. On **Machine A** (receiver): select _Receive_ mode, choose a destination folder, click **Start**.
 2. On **Machine B** (sender): select _Send_ mode, choose the folder to share, enter Machine A's IP and port, click **Start**.
 3. Files are synced immediately. Any subsequent changes are detected and transferred in real-time.
-
-### Build standalone executable
-
-```bash
-pip install pyinstaller
-pyinstaller run.spec
-```
-
-The executable is generated in `dist/run/`.
 
 ## Configuration
 
@@ -134,7 +121,6 @@ PyLanShare uses a custom protocol (v2) over WebSocket:
 ```
 PyLanShare/
 ├── run.py                  # Entry point
-├── run.spec                # PyInstaller spec
 ├── pylanshare/
 │   ├── core/               # Protocol, hashing, compression, ignore engine
 │   ├── gui/                # PySide6 window, tray, dialogs, async worker
