@@ -1,6 +1,7 @@
 """Receiver: WebSocket server that receives and writes files."""
 
 import asyncio
+import hashlib
 import logging
 import os
 import shutil
@@ -11,7 +12,7 @@ from pathlib import Path
 import websockets
 
 from ..core.protocol import PROTOCOL_VERSION, MsgType, make_msg, parse_chunk_frame, parse_msg
-from ..core.transfer import build_manifest, hash_file
+from ..core.transfer import build_manifest
 
 log = logging.getLogger("pylanshare.receiver")
 
@@ -110,6 +111,7 @@ class Receiver:
         current_file: dict | None = None
         tmp_handle = None
         bytes_received = 0
+        hasher = None
 
         try:
             async for raw in ws:
@@ -117,13 +119,21 @@ class Receiver:
                     if current_file is None:
                         self._emit_log("Warning: received chunk without FILE_START")
                         continue
-                    compressed = parse_chunk_frame(raw)
-                    data = zlib.decompress(compressed)
-                    tmp_handle.write(data)
-                    bytes_received += len(data)
+                    def _proc(r, h, th):
+                        c = parse_chunk_frame(r)
+                        d = zlib.decompress(c)
+                        th.write(d)
+                        h.update(d)
+                        return len(d)
+
+                    n = await asyncio.to_thread(_proc, raw, hasher, tmp_handle)
+                    bytes_received += n
                     self._emit_progress(
                         current_file["path"], bytes_received, current_file["size"]
                     )
+                    # Small pause after every chunk — spreads disk writes
+                    # evenly instead of letting the OS accumulate and stall.
+                    await asyncio.sleep(0.005)
                     continue
 
                 msg = parse_msg(raw)
@@ -170,6 +180,7 @@ class Receiver:
                     tmp_path = dest.with_name(dest.name + ".pylanshare.tmp")
                     tmp_handle = open(tmp_path, "wb")
                     bytes_received = 0
+                    hasher = hashlib.sha256()
                     current_file = msg
                     self._emit_log(f"Receiving: {rel_path} ({msg['size']:,} bytes)")
                     self._emit_status(f"Receiving {rel_path}")
@@ -182,10 +193,10 @@ class Receiver:
                     dest = self.dest_dir / rel_path
                     tmp_path = dest.with_name(dest.name + ".pylanshare.tmp")
 
-                    # Hash verification
+                    # Hash verification (incremental — no re-read needed)
                     expected_hash = current_file.get("hash") if current_file else None
                     if expected_hash:
-                        actual_hash = hash_file(tmp_path)
+                        actual_hash = hasher.hexdigest()
                         if actual_hash != expected_hash:
                             self._emit_log(
                                 f"Hash mismatch for {rel_path}: "
@@ -265,6 +276,8 @@ class Receiver:
             self.port,
             max_size=None,
             ssl=self._ssl_context,
+            max_queue=4,
+            write_limit=2 * 1024 * 1024,
         )
         self._emit_log(f"Protocol: {scheme}")
         try:

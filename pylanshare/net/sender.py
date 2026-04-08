@@ -8,7 +8,7 @@ from pathlib import Path
 import websockets
 
 from ..core.protocol import PROTOCOL_VERSION, MsgType, make_chunk_frame, make_msg, parse_msg
-from ..core.transfer import build_manifest, hash_file, read_chunks
+from ..core.transfer import aread_chunks, build_manifest, hash_file
 from ..watch.watcher import FolderWatcher
 
 log = logging.getLogger("pylanshare.sender")
@@ -87,12 +87,14 @@ class Sender:
         ))
 
         bytes_sent = 0
-        for compressed_chunk in read_chunks(filepath, self._compression_level):
+        async for compressed_chunk in aread_chunks(filepath, self._compression_level):
             await self._ws.send(make_chunk_frame(compressed_chunk))
             bytes_sent = min(bytes_sent + 1024 * 1024, stat.st_size)
             self._emit_progress(rel_path, bytes_sent, stat.st_size)
             if self._rate_limit > 0:
                 await asyncio.sleep(len(compressed_chunk) / self._rate_limit)
+            else:
+                await asyncio.sleep(0)
 
         await self._ws.send(make_msg(MsgType.FILE_END, path=rel_path, hash=file_hash))
         self._emit_log(f"Sent: {rel_path}")
@@ -193,7 +195,8 @@ class Sender:
         self._emit_log(f"Connecting to {uri}...")
         self._emit_status("Connecting")
 
-        async with websockets.connect(uri, max_size=None, ssl=self._ssl_context) as ws:
+        async with websockets.connect(uri, max_size=None, ssl=self._ssl_context,
+                                       max_queue=4, write_limit=2 * 1024 * 1024) as ws:
             self._ws = ws
 
             await ws.send(make_msg(MsgType.HANDSHAKE,

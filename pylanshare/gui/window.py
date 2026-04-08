@@ -33,6 +33,7 @@ from ..core.ignore import load_patterns
 from ..net.discovery import get_lan_hosts
 from ..net.receiver import Receiver
 from ..net.sender import Sender
+from ..net.sync_peer import SyncClient, SyncServer
 from .ignore_dialog import IgnoreDialog
 from .tray import TrayManager
 from .worker import AsyncWorker
@@ -94,8 +95,11 @@ class MainWindow(ToolWindow):
             self._port_edit.setText(str(p))
         if pw := data.get("password"):
             self._password_edit.setText(pw)
-        if data.get("role") == "receive":
+        role = data.get("role")
+        if role == "receive":
             self._radio_receive.setChecked(True)
+        elif role == "sync":
+            self._radio_sync.setChecked(True)
         if "minimize_to_tray" in data:
             self._minimize_to_tray_action.setChecked(data["minimize_to_tray"])
         if "rate_limit" in data:
@@ -117,7 +121,9 @@ class MainWindow(ToolWindow):
             "host": self._host_combo.currentText().strip(),
             "port": self._port_edit.text().strip(),
             "password": self._password_edit.text().strip(),
-            "role": "send" if self._radio_send.isChecked() else "receive",
+            "role": ("send" if self._radio_send.isChecked()
+                     else "sync" if self._radio_sync.isChecked()
+                     else "receive"),
             "minimize_to_tray": self._minimize_to_tray_action.isChecked(),
             "rate_limit": _SPEED_PRESETS[self._speed_combo.currentIndex()][1],
             "use_tls": self._tls_check.isChecked(),
@@ -173,9 +179,11 @@ class MainWindow(ToolWindow):
         role_layout.setSpacing(24)
         self._radio_send = QRadioButton("Send")
         self._radio_receive = QRadioButton("Receive")
+        self._radio_sync = QRadioButton("Sync")
         self._radio_send.setChecked(True)
         role_layout.addWidget(self._radio_send)
         role_layout.addWidget(self._radio_receive)
+        role_layout.addWidget(self._radio_sync)
         role_layout.addStretch()
         container_layout.addWidget(role_group)
 
@@ -208,8 +216,9 @@ class MainWindow(ToolWindow):
         self._password_edit.setPlaceholderText("Optional shared password...")
         grid.addWidget(self._password_edit, 1, 1, 1, 4)  # span to end
 
-        # Row 2: Receiver IP + Port
-        grid.addWidget(self.make_label("Receiver IP:"), 2, 0, Qt.AlignVCenter)
+        # Row 2: Host + Port
+        self._host_label = self.make_label("Receiver IP:")
+        grid.addWidget(self._host_label, 2, 0, Qt.AlignVCenter)
         self._host_combo = QComboBox()
         self._host_combo.setEditable(True)
         self._host_combo.setCurrentText("localhost")
@@ -282,16 +291,14 @@ class MainWindow(ToolWindow):
         btn_row = QHBoxLayout()
         btn_row.setSpacing(10)
         btn_row.setContentsMargins(0, 4, 0, 4)
-        self._start_btn = self.make_button("Start", command=self._on_start)
-        self._stop_btn = self.make_button("Stop", command=self._on_stop, danger=True)
-        self._stop_btn.setEnabled(False)
+        self._start_btn = self.make_button("Start", command=self._on_toggle)
+        self._is_running = False
 
         self._ignore_btn = self.make_button("Ignore Patterns", command=self._on_ignore_patterns, primary=False)
         self._sync_btn = self.make_button("Force Sync", command=self._on_force_sync, primary=False)
         self._sync_btn.setEnabled(False)
 
         btn_row.addWidget(self._start_btn)
-        btn_row.addWidget(self._stop_btn)
         btn_row.addStretch()
         btn_row.addWidget(self._ignore_btn)
         btn_row.addWidget(self._sync_btn)
@@ -323,11 +330,24 @@ class MainWindow(ToolWindow):
         progress_container.addWidget(self._progress_bar)
         container_layout.addLayout(progress_container)
 
-        # -- Log --
+        # Session counters (reset on start)
+        self._stats = {
+            "files_sent": 0, "files_recv": 0, "files_del": 0,
+            "bytes_sent": 0, "bytes_recv": 0,
+        }
+
+        # -- Log header with inline stats --
+        log_header = QHBoxLayout()
+        log_header.setContentsMargins(0, 0, 0, 0)
         log_label = self.make_label("Log", dim=True)
         log_label.setFont(font(FONT_SIZE_SMALL, bold=True))
         log_label.setStyleSheet(f"color: {COLORS['text_dim']}; padding: 0;")
-        container_layout.addWidget(log_label)
+        log_header.addWidget(log_label)
+        log_header.addStretch()
+        self._stats_label = self.make_label("", dim=True)
+        self._stats_label.setFont(font(FONT_SIZE_SMALL))
+        log_header.addWidget(self._stats_label)
+        container_layout.addLayout(log_header)
 
         self._log = QTextEdit()
         self._log.setReadOnly(True)
@@ -352,6 +372,8 @@ class MainWindow(ToolWindow):
 
         # Role toggle
         self._radio_send.toggled.connect(self._on_role_changed)
+        self._radio_receive.toggled.connect(self._on_role_changed)
+        self._radio_sync.toggled.connect(self._on_role_changed)
         self._on_role_changed()
 
     @staticmethod
@@ -368,13 +390,25 @@ class MainWindow(ToolWindow):
 
     def _on_role_changed(self):
         is_send = self._radio_send.isChecked()
-        self._host_combo.setEnabled(is_send)
-        self._refresh_hosts_btn.setVisible(is_send)
-        self._speed_label.setVisible(is_send)
-        self._speed_combo.setVisible(is_send)
-        if not is_send:
+        is_sync = self._radio_sync.isChecked()
+        show_host = is_send or is_sync
+        self._host_combo.setEnabled(show_host)
+        self._refresh_hosts_btn.setVisible(show_host)
+        self._speed_label.setVisible(show_host)
+        self._speed_combo.setVisible(show_host)
+        if is_sync:
+            self._host_label.setText("Server IP:")
+            self._host_combo.lineEdit().setPlaceholderText(
+                "0.0.0.0 = listen, or enter server IP..."
+            )
+        else:
+            self._host_label.setText("Receiver IP:")
+            self._host_combo.lineEdit().setPlaceholderText("IP or hostname...")
+        if not show_host:
             self._host_combo.setCurrentText("0.0.0.0")
-        elif self._host_combo.currentText() == "0.0.0.0":
+        elif is_sync and self._host_combo.currentText() == "localhost":
+            self._host_combo.setCurrentText("0.0.0.0")
+        elif is_send and self._host_combo.currentText() == "0.0.0.0":
             self._host_combo.setCurrentText("localhost")
 
     def _refresh_hosts(self):
@@ -418,8 +452,11 @@ class MainWindow(ToolWindow):
         if not cert:
             self._append_log("Error: TLS enabled but no certificate path set")
             return None
-        is_send = self._radio_send.isChecked()
-        if is_send:
+        host = self._host_combo.currentText().strip()
+        is_client = self._radio_send.isChecked() or (
+            self._radio_sync.isChecked() and host != "0.0.0.0"
+        )
+        if is_client:
             ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
@@ -468,9 +505,47 @@ class MainWindow(ToolWindow):
             if self._tray:
                 self._tray.set_reconnecting()
 
+    @staticmethod
+    def _format_bytes(n: int) -> str:
+        if n < 1024:
+            return f"{n} B"
+        if n < 1024 * 1024:
+            return f"{n / 1024:.1f} KB"
+        if n < 1024 * 1024 * 1024:
+            return f"{n / (1024 * 1024):.1f} MB"
+        return f"{n / (1024 * 1024 * 1024):.2f} GB"
+
+    def _refresh_stats(self):
+        s = self._stats
+        total_bytes = s["bytes_sent"] + s["bytes_recv"]
+        total_files = s["files_sent"] + s["files_recv"]
+        parts = []
+        if total_files:
+            parts.append(f"{total_files} files")
+        if total_bytes:
+            parts.append(self._format_bytes(total_bytes))
+        if s["files_del"]:
+            parts.append(f"{s['files_del']} deleted")
+        self._stats_label.setText("  |  ".join(parts))
+
+    def _reset_stats(self):
+        for k in self._stats:
+            self._stats[k] = 0
+        self._stats_label.setText("")
+
     @Slot(str)
     def _append_log(self, text: str):
         self._log.append(text)
+        # Track session stats from log messages
+        if text.startswith("Sent: "):
+            self._stats["files_sent"] += 1
+            self._refresh_stats()
+        elif text.startswith("Received: "):
+            self._stats["files_recv"] += 1
+            self._refresh_stats()
+        elif text.startswith("Deleted: ") or text.startswith("Delete: "):
+            self._stats["files_del"] += 1
+            self._refresh_stats()
 
     @Slot(str)
     def _update_status(self, text: str):
@@ -486,6 +561,19 @@ class MainWindow(ToolWindow):
         if current >= total:
             self._progress_bar.setVisible(False)
             self._progress_label.setVisible(False)
+            # Track transferred bytes (sent or received based on status text)
+            status = self._status_label.text()
+            if "Sending" in status:
+                self._stats["bytes_sent"] += total
+            elif "Receiving" in status:
+                self._stats["bytes_recv"] += total
+            self._refresh_stats()
+
+    def _on_toggle(self):
+        if self._is_running:
+            self._on_stop()
+        else:
+            self._on_start()
 
     def _on_start(self):
         dir_path = self._dir_edit.text().strip()
@@ -519,6 +607,36 @@ class MainWindow(ToolWindow):
                 await sender.run()
 
             self._start_worker(run_sender)
+        elif self._radio_sync.isChecked():
+            is_server = (host == "0.0.0.0")
+
+            def _wire_sync(service, worker):
+                service.on_log.append(lambda m: worker.log_signal.emit(m))
+                service.on_status.append(lambda m: worker.status_signal.emit(m))
+                service.on_progress.append(lambda f, c, t: worker.progress_signal.emit(f, c, t))
+                service.on_connected.append(lambda c: worker.connected_signal.emit(c))
+                service.on_reconnecting.append(lambda r: worker.reconnecting_signal.emit(r))
+
+            if is_server:
+                async def run_sync_server(worker: AsyncWorker):
+                    server = SyncServer(base_dir, host, port,
+                                        token=token, ignore_patterns=ignore,
+                                        rate_limit=rate_limit, ssl_context=ssl_ctx)
+                    _wire_sync(server, worker)
+                    worker._service = server
+                    await server.run()
+
+                self._start_worker(run_sync_server)
+            else:
+                async def run_sync_client(worker: AsyncWorker):
+                    client = SyncClient(base_dir, host, port,
+                                        token=token, ignore_patterns=ignore,
+                                        rate_limit=rate_limit, ssl_context=ssl_ctx)
+                    _wire_sync(client, worker)
+                    worker._service = client
+                    await client.run()
+
+                self._start_worker(run_sync_client)
         else:
             async def run_receiver(worker: AsyncWorker):
                 receiver = Receiver(base_dir, host, port,
@@ -534,6 +652,8 @@ class MainWindow(ToolWindow):
             self._start_worker(run_receiver)
 
     def _start_worker(self, coro_factory):
+        self._reset_stats()
+        self._log.clear()
         self._worker = AsyncWorker(coro_factory)
         self._worker.log_signal.connect(self._append_log)
         self._worker.status_signal.connect(self._update_status)
@@ -542,12 +662,16 @@ class MainWindow(ToolWindow):
         self._worker.reconnecting_signal.connect(self._on_reconnecting)
         self._worker.finished_signal.connect(self._on_worker_finished)
         self._worker.start()
+        self._is_running = True
 
-        self._start_btn.setEnabled(False)
-        self._stop_btn.setEnabled(True)
-        self._sync_btn.setEnabled(self._radio_send.isChecked())
+        self._start_btn.setText("Stop")
+        self._set_start_btn_color(COLORS['success'])
+        self._sync_btn.setEnabled(
+            self._radio_send.isChecked() or self._radio_sync.isChecked()
+        )
         self._radio_send.setEnabled(False)
         self._radio_receive.setEnabled(False)
+        self._radio_sync.setEnabled(False)
 
     def _on_stop(self):
         if self._worker:
@@ -556,17 +680,18 @@ class MainWindow(ToolWindow):
     def _on_force_sync(self):
         if self._worker and self._worker._loop and self._worker._service:
             service = self._worker._service
-            if isinstance(service, Sender):
+            if hasattr(service, "force_sync"):
                 asyncio.run_coroutine_threadsafe(service.force_sync(), self._worker._loop)
 
     @Slot()
     def _on_worker_finished(self):
-        self._start_btn.setEnabled(True)
+        self._is_running = False
+        self._start_btn.setText("Start")
         self._set_start_btn_color(COLORS['primary'])
-        self._stop_btn.setEnabled(False)
         self._sync_btn.setEnabled(False)
         self._radio_send.setEnabled(True)
         self._radio_receive.setEnabled(True)
+        self._radio_sync.setEnabled(True)
         self._worker = None
         self._status_label.setText("Stopped")
         if self._tray:

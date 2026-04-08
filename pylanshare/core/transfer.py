@@ -1,10 +1,11 @@
 """File hashing, chunking, and compression utilities."""
 
+import asyncio
 import hashlib
 import os
 import zlib
 from pathlib import Path
-from typing import Generator
+from typing import AsyncGenerator, Generator
 
 from .ignore import is_ignored
 from .protocol import CHUNK_SIZE
@@ -32,8 +33,55 @@ def read_chunks(filepath: Path, compression_level: int = 6) -> Generator[bytes, 
             yield zlib.compress(block, level=compression_level)
 
 
-def build_manifest(base_dir: Path, ignore_patterns: list[str] | None = None) -> dict[str, dict]:
-    """Build a manifest of {relative_path: {hash, size, mtime}} for all files."""
+async def aread_chunks(filepath: Path, compression_level: int = 6) -> AsyncGenerator[bytes, None]:
+    """Yield compressed chunks without blocking the event loop.
+
+    File I/O and compression run in a thread so the event loop stays responsive.
+    """
+    def _read_and_compress(fpath, level):
+        chunks = []
+        with open(fpath, "rb") as f:
+            while True:
+                block = f.read(CHUNK_SIZE)
+                if not block:
+                    break
+                chunks.append(zlib.compress(block, level=level))
+        return chunks
+
+    # For files <= 16 MB, do it all in one thread call to reduce overhead
+    file_size = filepath.stat().st_size
+    if file_size <= 16 * 1024 * 1024:
+        chunks = await asyncio.to_thread(_read_and_compress, filepath, compression_level)
+        for chunk in chunks:
+            yield chunk
+    else:
+        # For large files, read+compress one chunk at a time in a thread
+        # to avoid loading the whole file into memory
+        def _read_one(f, level):
+            block = f.read(CHUNK_SIZE)
+            if not block:
+                return None
+            return zlib.compress(block, level=level)
+
+        f = await asyncio.to_thread(open, filepath, "rb")
+        try:
+            while True:
+                compressed = await asyncio.to_thread(_read_one, f, compression_level)
+                if compressed is None:
+                    break
+                yield compressed
+        finally:
+            await asyncio.to_thread(f.close)
+
+
+def build_manifest(base_dir: Path, ignore_patterns: list[str] | None = None,
+                    quick: bool = False) -> dict[str, dict]:
+    """Build a manifest of {relative_path: {hash, size, mtime}} for all files.
+
+    If quick=True, skip SHA-256 hashing (use mtime+size only). Much faster
+    for large directories — suitable for sync mode where hash verification
+    happens per-file during transfer.
+    """
     patterns = ignore_patterns or []
     manifest = {}
     for root, dirs, files in os.walk(base_dir):
@@ -45,10 +93,12 @@ def build_manifest(base_dir: Path, ignore_patterns: list[str] | None = None) -> 
             rel = filepath.relative_to(base_dir).as_posix()
             if patterns and is_ignored(rel, patterns):
                 continue
-            stat = filepath.stat()
-            manifest[rel] = {
-                "hash": hash_file(filepath),
-                "size": stat.st_size,
-                "mtime": stat.st_mtime,
-            }
+            try:
+                st = filepath.stat()
+            except OSError:
+                continue
+            entry = {"size": st.st_size, "mtime": st.st_mtime}
+            if not quick:
+                entry["hash"] = hash_file(filepath)
+            manifest[rel] = entry
     return manifest

@@ -56,12 +56,53 @@ class _DebouncedHandler(FileSystemEventHandler):
     def on_deleted(self, event):
         self._handle(event)
 
+    def _is_src_ignored(self, src: str) -> bool:
+        """Check if a source path should be ignored."""
+        if not self._ignore_patterns:
+            return False
+        from ..core.ignore import is_ignored
+        try:
+            rel = Path(src).relative_to(self._watch_dir).as_posix()
+        except ValueError:
+            return True
+        return is_ignored(rel, self._ignore_patterns)
+
     def on_moved(self, event):
-        if not event.is_directory:
-            self._pending[event.src_path] = ("deleted", time.monotonic())
-            self._loop.call_soon_threadsafe(asyncio.ensure_future, self._flush(event.src_path))
+        if event.is_directory:
+            # Directory rename: emit delete for old paths, create for new paths
+            src_dir = Path(event.src_path)
+            dest_dir = Path(event.dest_path)
+            for filepath in dest_dir.rglob("*"):
+                if filepath.is_file():
+                    # Infer old path from relative position
+                    rel = filepath.relative_to(dest_dir)
+                    old_path = str(src_dir / rel)
+                    if not self._is_src_ignored(old_path):
+                        self._pending[old_path] = ("deleted", time.monotonic())
+                        self._loop.call_soon_threadsafe(
+                            asyncio.ensure_future, self._flush(old_path)
+                        )
+                    # Emit create for new path
+                    self._handle(
+                        type("E", (), {
+                            "is_directory": False,
+                            "src_path": str(filepath),
+                            "event_type": "created",
+                        })()
+                    )
+        else:
+            # File rename: delete old + create new, with ignore check
+            if not self._is_src_ignored(event.src_path):
+                self._pending[event.src_path] = ("deleted", time.monotonic())
+                self._loop.call_soon_threadsafe(
+                    asyncio.ensure_future, self._flush(event.src_path)
+                )
             self._handle(
-                type("E", (), {"is_directory": False, "src_path": event.dest_path, "event_type": "created"})()
+                type("E", (), {
+                    "is_directory": False,
+                    "src_path": event.dest_path,
+                    "event_type": "created",
+                })()
             )
 
 
