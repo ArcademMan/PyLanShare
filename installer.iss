@@ -1,13 +1,13 @@
 [Setup]
 ; Info applicazione
 AppName=PyLanShare
-AppVersion=1.0.0
+AppVersion=1.0.1
 AppPublisher=AmMstools
-AppPublisherURL=https://github.com/AmMstools
+AppPublisherURL=https://github.com/ArcademMan
 DefaultDirName={autopf}\PyLanShare
 DefaultGroupName=PyLanShare
 OutputDir=installer_output
-OutputBaseFilename=PyLanShare_Setup_1.0.0
+OutputBaseFilename=PyLanShare_Setup_1.0.1
 Compression=lzma2
 SolidCompression=yes
 SetupIconFile=assets\icon.ico

@@ -36,6 +36,7 @@ from ..net.sender import Sender
 from ..net.sync_peer import SyncClient, SyncServer
 from .ignore_dialog import IgnoreDialog
 from .tray import TrayManager
+from .update_checker import UpdateCheckThread, RELEASE_URL
 from .worker import AsyncWorker
 
 _SPEED_PRESETS = [
@@ -79,8 +80,44 @@ class MainWindow(ToolWindow):
         if QSystemTrayIcon.isSystemTrayAvailable():
             self._tray = TrayManager(self)
 
+        # Check for updates (non-blocking)
+        self._update_thread: UpdateCheckThread | None = None
+        self._check_for_updates()
+
     _SETTINGS_DIR = Path(os.environ.get("APPDATA", "")) / "AmMstools" / "pylanshare"
     _SETTINGS_FILE = _SETTINGS_DIR / "settings.json"
+
+    # -- Update check -------------------------------------------------
+
+    def _check_for_updates(self, *, manual: bool = False):
+        self._update_manual = manual
+        self._update_thread = UpdateCheckThread()
+        self._update_thread.result.connect(self._on_update_result)
+        self._update_thread.start()
+
+    @Slot(bool, str, str)
+    def _on_update_result(self, available: bool, tag: str, url: str):
+        from PySide6.QtWidgets import QMessageBox
+        from .. import __version__
+
+        if available:
+            box = QMessageBox(self)
+            box.setWindowTitle("Update available")
+            box.setText(
+                f"A new version of PyLanShare is available: <b>{tag}</b><br>"
+                f"(current: {__version__})"
+            )
+            box.setInformativeText(
+                f'<a href="{url}">Download from GitHub</a>'
+            )
+            box.setStandardButtons(QMessageBox.StandardButton.Ok)
+            box.exec()
+        elif self._update_manual:
+            box = QMessageBox(self)
+            box.setWindowTitle("No updates")
+            box.setText(f"You are running the latest version ({__version__}).")
+            box.setStandardButtons(QMessageBox.StandardButton.Ok)
+            box.exec()
 
     def _load_settings(self):
         try:
@@ -163,6 +200,11 @@ class MainWindow(ToolWindow):
         self._minimize_to_tray_action = QAction("Minimize to tray on close", self, checkable=True)
         self._minimize_to_tray_action.setChecked(True)
         settings_menu.addAction(self._minimize_to_tray_action)
+
+        settings_menu.addSeparator()
+        check_update_action = QAction("Check for updates...", self)
+        check_update_action.triggered.connect(lambda: self._check_for_updates(manual=True))
+        settings_menu.addAction(check_update_action)
 
     def _build_ui(self):
         container = QWidget()

@@ -47,7 +47,7 @@ def build_nuitka():
         f"--include-data-dir={ROOT / 'pylanshare' / 'assets'}=pylanshare/assets",
         # Product info
         f"--product-name={APP_NAME}",
-        "--product-version=1.0.0",
+        "--product-version=1.0.1",
         f"--company-name=AmMstools",
         f"--file-description={APP_NAME} — LAN File Sync",
         "--copyright=MIT License",
