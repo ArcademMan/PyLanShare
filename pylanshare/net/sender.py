@@ -1,6 +1,7 @@
 """Sender: connects to a receiver via WebSocket and sends files."""
 
 import asyncio
+import hashlib
 import logging
 import time
 from pathlib import Path
@@ -8,7 +9,7 @@ from pathlib import Path
 import websockets
 
 from ..core.protocol import PROTOCOL_VERSION, MsgType, make_chunk_frame, make_msg, parse_msg
-from ..core.transfer import aread_chunks, build_manifest, hash_file
+from ..core.transfer import aread_chunks_hashed, build_manifest
 from ..watch.watcher import FolderWatcher
 
 log = logging.getLogger("pylanshare.sender")
@@ -72,37 +73,45 @@ class Sender:
         filepath = self.watch_dir / rel_path
         if not filepath.is_file():
             return
-        stat = filepath.stat()
-        file_hash = hash_file(filepath)
+        st = filepath.stat()
 
-        self._emit_log(f"Sending: {rel_path} ({stat.st_size:,} bytes)")
+        self._emit_log(f"Sending: {rel_path} ({st.st_size:,} bytes)")
         self._emit_status(f"Sending {rel_path}")
 
+        # Send FILE_START without hash — hash is computed incrementally
+        # during the transfer and sent in FILE_END.
         await self._ws.send(make_msg(
             MsgType.FILE_START,
             path=rel_path,
-            size=stat.st_size,
-            hash=file_hash,
-            mtime=stat.st_mtime,
+            size=st.st_size,
+            hash="",
+            mtime=st.st_mtime,
         ))
 
+        hasher = hashlib.sha256()
         bytes_sent = 0
-        async for compressed_chunk in aread_chunks(filepath, self._compression_level):
+        async for compressed_chunk, raw_len in aread_chunks_hashed(
+            filepath, self._compression_level, hasher
+        ):
             await self._ws.send(make_chunk_frame(compressed_chunk))
-            bytes_sent = min(bytes_sent + 1024 * 1024, stat.st_size)
-            self._emit_progress(rel_path, bytes_sent, stat.st_size)
+            bytes_sent = min(bytes_sent + raw_len, st.st_size)
+            self._emit_progress(rel_path, bytes_sent, st.st_size)
             if self._rate_limit > 0:
                 await asyncio.sleep(len(compressed_chunk) / self._rate_limit)
             else:
                 await asyncio.sleep(0)
 
+        file_hash = hasher.hexdigest()
         await self._ws.send(make_msg(MsgType.FILE_END, path=rel_path, hash=file_hash))
         self._emit_log(f"Sent: {rel_path}")
 
     async def _full_sync(self):
         self._emit_log("Building file manifest...")
         self._emit_status("Building manifest")
-        manifest = build_manifest(self.watch_dir, ignore_patterns=self._ignore_patterns)
+        manifest = await asyncio.to_thread(
+            build_manifest, self.watch_dir,
+            ignore_patterns=self._ignore_patterns, quick=True,
+        )
         self._emit_log(f"Manifest: {len(manifest)} files")
 
         await self._ws.send(make_msg(MsgType.MANIFEST, files=manifest))

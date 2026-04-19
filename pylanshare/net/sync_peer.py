@@ -17,7 +17,6 @@ from pathlib import Path
 import websockets
 
 from ..core.protocol import (
-    CHUNK_SIZE,
     PROTOCOL_VERSION,
     MsgType,
     make_chunk_frame,
@@ -25,7 +24,7 @@ from ..core.protocol import (
     parse_chunk_frame,
     parse_msg,
 )
-from ..core.transfer import aread_chunks, build_manifest, hash_file
+from ..core.transfer import aread_chunks_hashed, build_manifest
 from ..watch.watcher import FolderWatcher
 
 log = logging.getLogger("pylanshare.sync")
@@ -157,28 +156,29 @@ class _SyncBase:
             return
         st = filepath.stat()
 
-        # Hash in a thread to avoid blocking the event loop
-        file_hash = await asyncio.to_thread(hash_file, filepath)
-
         self._emit_log(f"Sending: {rel_path} ({st.st_size:,} bytes)")
         self._emit_status(f"Sending {rel_path}")
 
         await ws.send(make_msg(
             MsgType.FILE_START,
             path=rel_path, size=st.st_size,
-            hash=file_hash, mtime=st.st_mtime,
+            hash="", mtime=st.st_mtime,
         ))
 
+        hasher = hashlib.sha256()
         bytes_sent = 0
-        async for compressed_chunk in aread_chunks(filepath, self._compression_level):
+        async for compressed_chunk, raw_len in aread_chunks_hashed(
+            filepath, self._compression_level, hasher
+        ):
             await ws.send(make_chunk_frame(compressed_chunk))
-            bytes_sent = min(bytes_sent + CHUNK_SIZE, st.st_size)
+            bytes_sent = min(bytes_sent + raw_len, st.st_size)
             self._emit_progress(rel_path, bytes_sent, st.st_size)
             if self._rate_limit > 0:
                 await asyncio.sleep(len(compressed_chunk) / self._rate_limit)
             else:
                 await asyncio.sleep(0)
 
+        file_hash = hasher.hexdigest()
         await ws.send(make_msg(MsgType.FILE_END, path=rel_path, hash=file_hash))
         self._emit_log(f"Sent: {rel_path}")
 
@@ -272,7 +272,7 @@ class _SyncBase:
         dest = self.sync_dir / rel_path
         tmp_path = dest.with_name(dest.name + ".pylanshare.tmp")
 
-        expected_hash = cf.get("hash")
+        expected_hash = msg.get("hash") or cf.get("hash")
         if expected_hash:
             actual_hash = recv_state["hasher"].hexdigest()
             if actual_hash != expected_hash:

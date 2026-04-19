@@ -157,13 +157,17 @@ class Receiver:
 
                 elif mt == MsgType.MANIFEST:
                     sender_files = msg["files"]
-                    local_manifest = build_manifest(self.dest_dir,
-                                                     ignore_patterns=self._ignore_patterns)
+                    local_manifest = await asyncio.to_thread(
+                        build_manifest, self.dest_dir,
+                        ignore_patterns=self._ignore_patterns, quick=True,
+                    )
 
                     needed = []
                     for path, info in sender_files.items():
                         local = local_manifest.get(path)
-                        if local is None or local["hash"] != info["hash"]:
+                        if local is None:
+                            needed.append(path)
+                        elif local["size"] != info["size"] or abs(local["mtime"] - info["mtime"]) > 0.01:
                             needed.append(path)
 
                     deleted = [p for p in local_manifest if p not in sender_files]
@@ -193,8 +197,11 @@ class Receiver:
                     dest = self.dest_dir / rel_path
                     tmp_path = dest.with_name(dest.name + ".pylanshare.tmp")
 
-                    # Hash verification (incremental — no re-read needed)
-                    expected_hash = current_file.get("hash") if current_file else None
+                    # Hash verification — prefer FILE_END hash (incremental),
+                    # fall back to FILE_START hash for older senders.
+                    expected_hash = msg.get("hash") or (
+                        current_file.get("hash") if current_file else None
+                    )
                     if expected_hash:
                         actual_hash = hasher.hexdigest()
                         if actual_hash != expected_hash:

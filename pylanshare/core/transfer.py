@@ -74,6 +74,50 @@ async def aread_chunks(filepath: Path, compression_level: int = 6) -> AsyncGener
             await asyncio.to_thread(f.close)
 
 
+async def aread_chunks_hashed(
+    filepath: Path, compression_level: int, hasher
+) -> AsyncGenerator[tuple[bytes, int], None]:
+    """Yield (compressed_chunk, raw_byte_count) while updating *hasher* incrementally.
+
+    Single-pass: the file is read once, hashed and compressed in the same thread
+    call, so callers never need a separate hash_file() read.
+    """
+
+    file_size = filepath.stat().st_size
+    if file_size <= 16 * 1024 * 1024:
+        def _read_all(fpath, level, h):
+            results = []
+            with open(fpath, "rb") as f:
+                while True:
+                    block = f.read(CHUNK_SIZE)
+                    if not block:
+                        break
+                    h.update(block)
+                    results.append((zlib.compress(block, level=level), len(block)))
+            return results
+
+        chunks = await asyncio.to_thread(_read_all, filepath, compression_level, hasher)
+        for item in chunks:
+            yield item
+    else:
+        def _read_one(f, level, h):
+            block = f.read(CHUNK_SIZE)
+            if not block:
+                return None
+            h.update(block)
+            return zlib.compress(block, level=level), len(block)
+
+        f = await asyncio.to_thread(open, filepath, "rb")
+        try:
+            while True:
+                result = await asyncio.to_thread(_read_one, f, compression_level, hasher)
+                if result is None:
+                    break
+                yield result
+        finally:
+            await asyncio.to_thread(f.close)
+
+
 def build_manifest(base_dir: Path, ignore_patterns: list[str] | None = None,
                     quick: bool = False) -> dict[str, dict]:
     """Build a manifest of {relative_path: {hash, size, mtime}} for all files.
